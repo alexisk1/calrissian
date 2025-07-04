@@ -320,8 +320,9 @@ class KubernetesPodBuilder(object):
                     container_resources[resource_bound] = {}
                 container_resources[resource_bound][resource_type] = resource_value
 
+        all_requirements = self.requirements + self.hints
         # Add CUDA requirements from CWL
-        for requirement in self.requirements:
+        for requirement in all_requirements:
             if requirement["class"] in ['cwltool:CUDARequirement', 'http://commonwl.org/cwltool#CUDARequirement']:
                 log.debug('Adding CUDARequirement resources spec')
 
@@ -344,12 +345,33 @@ class KubernetesPodBuilder(object):
     
     def pod_nodeselectors(self):
         """
-        Submitted node selectors must be strings
-        :return:
+        Return node selectors, injecting 'accelerator=nvidia' only if CUDA is required and not already set.
         """
-        return {str(k): str(v) for k, v in self.nodeselectors.items()}
+        selectors = {str(k): str(v) for k, v in self.nodeselectors.items()}
+
+        needs_cuda = any(
+            req.get("class") in ['cwltool:CUDARequirement', 'http://commonwl.org/cwltool#CUDARequirement']
+            for req in self.requirements + self.hints
+        )
+
+        if needs_cuda and 'accelerator' not in selectors:
+            selectors['accelerator'] = 'nvidia'
+
+        return selectors
 
     def build(self):
+        # Detect if the step requires CUDA
+        needs_cuda = any(
+            req.get("class") in ['cwltool:CUDARequirement', 'http://commonwl.org/cwltool#CUDARequirement']
+            for req in self.requirements + self.hints
+        )
+
+        # Compute node selectors
+        nodeselectors = {str(k): str(v) for k, v in self.nodeselectors.items()}
+        if needs_cuda and "accelerator" not in nodeselectors:
+            nodeselectors["accelerator"] = "nvidia"
+
+        # Base pod spec
         spec = {
             'metadata': {
                 'name': self.pod_name(),
@@ -374,13 +396,29 @@ class KubernetesPodBuilder(object):
                 'restartPolicy': 'Never',
                 'volumes': self.volumes,
                 'securityContext': self.security_context,
-                'nodeSelector': self.pod_nodeselectors()
+                'nodeSelector': nodeselectors
             }
         }
-        
+
+        # Inject service account if provided
         if ( self.serviceaccount ):
             spec['spec']['serviceAccountName'] = self.serviceaccount
-        
+
+        #Inject GPU toleration if needed
+        if needs_cuda:
+            tolerations = spec['spec'].get('tolerations', [])
+            has_gpu_toleration = any(
+                t.get('key') == 'nvidia.com/gpu' and t.get('effect') == 'NoSchedule'
+                for t in tolerations
+            )
+            if not has_gpu_toleration:
+                tolerations.append({
+                    "key": "nvidia.com/gpu",
+                    "operator": "Exists",
+                    "effect": "NoSchedule"
+                })
+            spec['spec']['tolerations'] = tolerations
+
         return spec
 
 
@@ -573,7 +611,7 @@ class CalrissianCommandLineJob(ContainerCommandLineJob):
                 tmpdir_prefix=runtimeContext.tmpdir_prefix,
                 secret_store=runtimeContext.secret_store,
                 any_path_okay=any_path_okay)
-
+        log.debug(f"Builder requirements: {self.builder.requirements}")
         k8s_builder = KubernetesPodBuilder(
             self.name,
             self._get_container_image(),

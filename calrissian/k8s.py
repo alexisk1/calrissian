@@ -59,6 +59,8 @@ class CompletionResult(object):
         self.finish_time = finish_time
         self.tool_log = tool_log
 
+MAIN_CONTAINER_ENV = 'CALRISSIAN_MAIN_CONTAINER'
+SIDECAR_PREFIXES = ('vault-agent',)
 
 class KubernetesClient(object):
     """
@@ -139,12 +141,18 @@ class KubernetesClient(object):
         return {"timestamp": f"{datetime.utcnow().isoformat()}Z", "pod": pod_name, "entry": log_entry}
 
     @retry_exponential_if_exception_type((ApiException, HTTPError,), log)
-    def follow_logs(self):
+    def follow_logs(self, container_name: str = None):
         pod_name = self.pod.metadata.name
+        log.info('[{}] follow_logs start (container={})'.format(pod_name, container_name or '<default>'))
+        stream = self.core_api_instance.read_namespaced_pod_log(
+            self.pod.metadata.name,
+            self.namespace,
+            container=container_name,
+            follow=True,
+            _preload_content=False
+        ).stream()
 
-        log.info('[{}] follow_logs start'.format(pod_name))
-        for line in self.core_api_instance.read_namespaced_pod_log(self.pod.metadata.name, self.namespace, follow=True,
-                                                                   _preload_content=False).stream():
+        for line in stream:
             # .stream() is only available if _preload_content=False
             # .stream() returns a generator, each iteration yields bytes.
             # kubernetes-client decodes them as utf-8 when _preload_content is True
@@ -153,27 +161,87 @@ class KubernetesClient(object):
             line = line.decode('utf-8', errors="ignore").rstrip()
             log.debug('[{}] {}'.format(pod_name, line))
             self.tool_log.append(self.format_log_entry(pod_name, line))
-        
         log.info('[{}] follow_logs end'.format(pod_name))
 
+
+    @staticmethod
+    def _pick_main_container_name(pod) -> str:
+        """Choose the workload container.
+        Priority: env override -> first non-sidecar -> first in spec."""
+        override = os.getenv(MAIN_CONTAINER_ENV)
+        if override:
+            return override
+        for c in (pod.spec.containers or []):
+            if not any(c.name.startswith(pfx) for pfx in SIDECAR_PREFIXES):
+                return c.name
+        # fallback
+        return pod.spec.containers[0].name
+
+    @staticmethod
+    def _get_container_status_by_name(pod, name) -> V1ContainerStatus:
+        for s in (pod.status.container_statuses or []):
+            if s.name == name:
+                return s
+        return None
+
+    @staticmethod
+    def _get_container_spec_by_name(pod, name) -> V1Container:
+        for c in (pod.spec.containers or []):
+            if c.name == name:
+                return c
+        return None
+
+    @staticmethod
+    def _any_init_container_failing(pod) -> str:
+        """Return a reason string if an init container is failing."""
+        for s in (pod.status.init_container_statuses or []):
+            st = s.state
+            if st and st.waiting and st.waiting.reason in ('CrashLoopBackOff', 'Error'):
+                return f"init container '{s.name}' is {st.waiting.reason}"
+            if st and st.terminated and s.restart_count > 0 and (st.terminated.exit_code != 0):
+                return f"init container '{s.name}' terminated: {st.terminated.reason or st.terminated.exit_code}"
+        return None
 
     @retry_exponential_if_exception_type((ApiException, HTTPError, IncompleteStatusException), log)
     def wait_for_completion(self) -> CompletionResult:
         w = watch.Watch()
         for event in w.stream(self.core_api_instance.list_namespaced_pod, self.namespace, field_selector=self._get_pod_field_selector()):
             pod = event['object']
-            status = self.get_first_or_none(pod.status.container_statuses)
+
+            # detect init container failures early
+            init_reason = self._any_init_container_failing(pod)
+            if init_reason:
+                log.error(f"{pod.metadata.name}: {init_reason}")
+                # try to dump last init logs for context
+                try:
+                    init_names = [s.name for s in (pod.status.init_container_statuses or [])]
+                    for iname in init_names:
+                        try:
+                            ilog = self.core_api_instance.read_namespaced_pod_log(
+                                pod.metadata.name, self.namespace, container=iname, previous=True, tail_lines=200
+                            )
+                            for ln in ilog.splitlines():
+                                self.tool_log.append(self.format_log_entry(pod.metadata.name, f"[init:{iname}] {ln}"))
+                        except Exception:
+                            pass
+                finally:
+                    raise CalrissianJobException(init_reason)
+
+            main_name = self._pick_main_container_name(pod)
+            status = self._get_container_status_by_name(pod, main_name)
             log.info('pod name {} with id {} has status {}'.format(pod.metadata.name, pod.metadata.uid, status))
+
             if status is None:
                 continue
             if self.state_is_waiting(status.state):
                 continue
             elif self.state_is_running(status.state):
                 # Can only get logs once container is running
-                self.follow_logs() # This will not return until pod completes
+                # follow logs for the workload container only
+                self.follow_logs(container_name=main_name) # This will not return until pod completes
             elif self.state_is_terminated(status.state):
                 log.info('Handling terminated pod name {} with id {}'.format(pod.metadata.name, pod.metadata.uid))
-                container = self.get_first_or_none(pod.spec.containers)
+                container = self._get_container_spec_by_name(pod, main_name)
                 self._handle_completion(status.state, container)
                 if self.should_delete_pod():
                     with PodMonitor() as monitor:
@@ -189,7 +257,6 @@ class KubernetesClient(object):
         # Otherwise it will lead to further exceptions
         if self.completion_result is None:
             raise IncompleteStatusException
-
         return self.completion_result
 
     def _set_pod(self, pod):

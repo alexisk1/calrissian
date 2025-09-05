@@ -198,7 +198,7 @@ class KubernetesVolumeBuilder(object):
 
 class KubernetesPodBuilder(object):
 
-    def __init__(self, name, container_image, environment, volume_mounts, volumes, command_line, stdout, stderr, stdin, resources, labels, nodeselectors, security_context, serviceaccount, requirements=None, hints=None):
+    def __init__(self, name, container_image, environment, volume_mounts, volumes, command_line, stdout, stderr, stdin, resources, labels, nodeselectors, security_context, serviceaccount, annotations=None, requirements=None, hints=None):
         self.name = name
         self.container_image = container_image
         self.environment = environment
@@ -213,7 +213,8 @@ class KubernetesPodBuilder(object):
         self.nodeselectors = nodeselectors
         self.security_context = security_context
         self.serviceaccount = serviceaccount
-        self.requirements = {} if requirements is None else requirements
+        self.annotations = {} if annotations is None else annotations
+        self.requirements = [] if requirements is None else requirements
         self.hints = [] if hints is None else hints
 
     def pod_name(self):
@@ -342,7 +343,14 @@ class KubernetesPodBuilder(object):
         :return:
         """
         return {str(k): str(v) for k, v in self.labels.items()}
-    
+
+    def pod_annotations(self):
+        """
+        Submitted annotations must be strings
+        :return:
+        """
+        return {str(k): str(v) for k, v in (self.annotations or {}).items()}
+
     def pod_nodeselectors(self):
         """
         Return node selectors, injecting 'accelerator=nvidia' only if CUDA is required and not already set.
@@ -376,6 +384,7 @@ class KubernetesPodBuilder(object):
             'metadata': {
                 'name': self.pod_name(),
                 'labels': self.pod_labels(),
+                'annotations': self.pod_annotations(),
             },
             'apiVersion': 'v1',
             'kind':'Pod',
@@ -560,6 +569,12 @@ class CalrissianCommandLineJob(ContainerCommandLineJob):
         else:
             return {}
 
+    def get_pod_annotations(self, runtimeContext):
+        if runtimeContext.pod_annotations:
+            return read_yaml(runtimeContext.pod_annotations)
+        else:
+            return {}
+
     def get_pod_serviceaccount(self, runtimeContext):
         return runtimeContext.pod_serviceaccount
 
@@ -612,6 +627,9 @@ class CalrissianCommandLineJob(ContainerCommandLineJob):
                 secret_store=runtimeContext.secret_store,
                 any_path_okay=any_path_okay)
         log.debug(f"Builder requirements: {self.builder.requirements}")
+        log.debug(f"calrissian get_pod_annotations: {str(self.get_pod_annotations(runtimeContext))}")
+        log.debug(f"calrissian get_pod_labels: {str(self.get_pod_labels(runtimeContext))}")
+
         k8s_builder = KubernetesPodBuilder(
             self.name,
             self._get_container_image(),
@@ -627,6 +645,7 @@ class CalrissianCommandLineJob(ContainerCommandLineJob):
             self.get_pod_nodeselectors(runtimeContext),
             self.get_security_context(runtimeContext),
             self.get_pod_serviceaccount(runtimeContext),
+            self.get_pod_annotations(runtimeContext),
             self.builder.requirements,
             self.builder.hints
         )
@@ -726,7 +745,7 @@ class CalrissianCommandLineJob(ContainerCommandLineJob):
         # directory." but spec might change to designated temp directory.
         # runtime.append("--env=HOME=/tmp")
         return {
-            "TMPDIR": self.CONTAINER_TMPDIR,
+            "TMPDIR": self.container_tmpdir,
             "HOME": self.builder.outdir,
         }
 

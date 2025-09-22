@@ -9,7 +9,7 @@ import threading
 import logging
 import os
 from urllib3.exceptions import HTTPError
-from datetime import datetime
+from datetime import datetime, timezone
 
 log = logging.getLogger('calrissian.k8s')
 
@@ -25,6 +25,10 @@ POD_NAME_ENV_VARIABLE = 'CALRISSIAN_POD_NAME'
 # Namespace to use if not running in cluster
 K8S_FALLBACK_NAMESPACE = 'default'
 
+# Default max number of none status states for pod to start initiliaze
+MAX_STATUS_NONE_COUNTS = 5
+
+WATCH_TIMEOUT_S = 5  # short, bounded HTTP watch
 
 def read_file(path):
     with open(path) as f:
@@ -59,7 +63,6 @@ class CompletionResult(object):
         self.finish_time = finish_time
         self.tool_log = tool_log
 
-MAIN_CONTAINER_ENV = 'CALRISSIAN_MAIN_CONTAINER'
 SIDECAR_PREFIXES = ('vault-agent',)
 
 class KubernetesClient(object):
@@ -79,6 +82,7 @@ class KubernetesClient(object):
         self.namespace = load_config_get_namespace()
         self.core_api_instance = client.CoreV1Api()
         self.tool_log = []
+        self.status_none_count = 0
 
     @retry_exponential_if_exception_type((ApiException, HTTPError,), log)
     def submit_pod(self, pod_body):
@@ -168,9 +172,8 @@ class KubernetesClient(object):
     def _pick_main_container_name(pod) -> str:
         """Choose the workload container.
         Priority: env override -> first non-sidecar -> first in spec."""
-        override = os.getenv(MAIN_CONTAINER_ENV)
-        if override:
-            return override
+        #log.info('_pick_main_container_name list: {} '.format(str(pod.spec.containers)))
+
         for c in (pod.spec.containers or []):
             if not any(c.name.startswith(pfx) for pfx in SIDECAR_PREFIXES):
                 return c.name
@@ -205,13 +208,21 @@ class KubernetesClient(object):
     @retry_exponential_if_exception_type((ApiException, HTTPError, IncompleteStatusException), log)
     def wait_for_completion(self) -> CompletionResult:
         w = watch.Watch()
-        for event in w.stream(self.core_api_instance.list_namespaced_pod, self.namespace, field_selector=self._get_pod_field_selector()):
+
+        for event in w.stream(
+            self.core_api_instance.list_namespaced_pod,
+            self.namespace,
+            field_selector=self._get_pod_field_selector(),
+            timeout_seconds=WATCH_TIMEOUT_S,
+        ):
             pod = event['object']
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            log.info("%s wait_for_completion pods object %s", ts, pod.metadata.name)
 
             # detect init container failures early
             init_reason = self._any_init_container_failing(pod)
             if init_reason:
-                log.error(f"{pod.metadata.name}: {init_reason}")
+                log.error(f"wait_for_completion init_reason error {pod.metadata.name}: {init_reason}")
                 # try to dump last init logs for context
                 try:
                     init_names = [s.name for s in (pod.status.init_container_statuses or [])]
@@ -229,18 +240,27 @@ class KubernetesClient(object):
 
             main_name = self._pick_main_container_name(pod)
             status = self._get_container_status_by_name(pod, main_name)
-            log.info('pod name {} with id {} has status {}'.format(pod.metadata.name, pod.metadata.uid, status))
+            log.info('wait_for_completion pod name {} with container name {} with id {} has status {}'.format(pod.metadata.name, main_name, pod.metadata.uid, status))
 
             if status is None:
+                log.info('wait_for_completion pod status_is_none {} container {}'.format(pod.metadata.name, main_name,  self.status_none_count))
+                if self.status_none_count < MAX_STATUS_NONE_COUNTS:
+                    self.status_none_count += 1
+                else:
+                    raise CalrissianJobException('Unexpected pod container status_is_none max limit ', status)
                 continue
-            if self.state_is_waiting(status.state):
+            elif self.state_is_waiting(status.state):
+                log.info('wait_for_completion state_is_waiting pod name {} with container name {} with id {} has status {} '.format(pod.metadata.name, main_name, pod.metadata.uid, status))
                 continue
             elif self.state_is_running(status.state):
                 # Can only get logs once container is running
                 # follow logs for the workload container only
+                log.info('wait_for_completion state_is_running pod name {} with container name {} with id {} has status {} '.format(pod.metadata.name, main_name, pod.metadata.uid, status))
                 self.follow_logs(container_name=main_name) # This will not return until pod completes
+                log.info('wait_for_completion pod {} follow_logs container {} '.format(pod.metadata.name, main_name))
+
             elif self.state_is_terminated(status.state):
-                log.info('Handling terminated pod name {} with id {}'.format(pod.metadata.name, pod.metadata.uid))
+                log.info('wait_for_completion Handling terminated pod name {} with id {}'.format(pod.metadata.name, pod.metadata.uid))
                 container = self._get_container_spec_by_name(pod, main_name)
                 self._handle_completion(status.state, container)
                 if self.should_delete_pod():

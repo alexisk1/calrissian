@@ -7,7 +7,7 @@ class RetryParameters(object):
     MULTIPLIER = float(os.getenv('RETRY_MULTIPLIER', 5)) #  Unit for multiplying the exponent
     MIN = float(os.getenv('RETRY_MIN', 5)) # Min time for retrying
     MAX = float(os.getenv('RETRY_MAX', 1200)) # Max interval between retries
-    ATTEMPTS = int(os.getenv('RETRY_ATTEMPTS', 10)) # Max number of retries before giving up
+    ATTEMPTS = int(os.getenv('RETRY_ATTEMPTS', 10)) # Max number of retries before giving up # debuging 5 production 10
 
 
 def retry_exponential_if_exception_type(exc_type, logger):

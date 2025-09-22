@@ -33,7 +33,7 @@ K8S_UNSAFE_REGEX = re.compile('[^-a-z0-9]')
 # Environment variable used to override image name used for initContainers
 INIT_IMAGE_ENV_VARIABLE = 'CALRISSIAN_INIT_IMAGE'
 DEFAULT_INIT_IMAGE = 'alpine:3.10'
-
+HIGH_MEM_POD_THRESHOLD = 7800
 
 class VolumeBuilderException(WorkflowException):
     pass
@@ -216,6 +216,7 @@ class KubernetesPodBuilder(object):
         self.annotations = {} if annotations is None else annotations
         self.requirements = [] if requirements is None else requirements
         self.hints = [] if hints is None else hints
+        self.high_mem_pod = False
 
     def pod_name(self):
         tag = random_tag()
@@ -312,6 +313,10 @@ class KubernetesPodBuilder(object):
     def container_resources(self):
         log.debug(f'Building resources spec from {self.resources}')
         container_resources = {}
+
+        # To evaluate high_mem_node compute container_resources before
+        # node selection
+        self.high_mem_pod = False
         for cwl_field, cwl_value in self.resources.items():
             resource_bound = 'requests'
             resource_type = self.resource_type(cwl_field)
@@ -320,6 +325,19 @@ class KubernetesPodBuilder(object):
                 if not container_resources.get(resource_bound):
                     container_resources[resource_bound] = {}
                 container_resources[resource_bound][resource_type] = resource_value
+                # cwl_value is the RAM amount in MiB (numeric); resource_value is a string like "4096Mi"
+                if resource_type == 'memory':
+                    try:
+                        mem_mib = int(cwl_value)
+                    except (TypeError, ValueError):
+                        # Fallback in case a string sneaks in
+                        mem_mib = int(str(cwl_value).rstrip("Mi"))
+                        log.debug(f'high_mem_pod   mem_mib {mem_mib}')
+
+                    if mem_mib >= HIGH_MEM_POD_THRESHOLD:
+                        self.high_mem_pod = True
+                        log.debug(f'high_mem_pod  {self.high_mem_pod }')
+
 
         all_requirements = self.requirements + self.hints
         # Add CUDA requirements from CWL
@@ -355,19 +373,27 @@ class KubernetesPodBuilder(object):
         """
         Return node selectors, injecting 'accelerator=nvidia' only if CUDA is required and not already set.
         """
+
         selectors = {str(k): str(v) for k, v in self.nodeselectors.items()}
 
         needs_cuda = any(
             req.get("class") in ['cwltool:CUDARequirement', 'http://commonwl.org/cwltool#CUDARequirement']
             for req in self.requirements + self.hints
         )
+        log.debug(f'pod_nodeselectors needs_cuda: {str(needs_cuda)}  high_mem_pod: {self.high_mem_pod}')
 
         if needs_cuda and 'accelerator' not in selectors:
             selectors['accelerator'] = 'nvidia'
 
+        if not needs_cuda and self.high_mem_pod:
+            selectors['nodegroup'] = 'high-mem'
+
         return selectors
 
     def build(self):
+        # Compute resources earlier to evaluate high mem node selection
+        resources = self.container_resources()
+
         # Detect if the step requires CUDA
         needs_cuda = any(
             req.get("class") in ['cwltool:CUDARequirement', 'http://commonwl.org/cwltool#CUDARequirement']
@@ -376,8 +402,10 @@ class KubernetesPodBuilder(object):
 
         # Compute node selectors
         nodeselectors = {str(k): str(v) for k, v in self.nodeselectors.items()}
-        if needs_cuda and "accelerator" not in nodeselectors:
-            nodeselectors["accelerator"] = "nvidia"
+        if needs_cuda and 'accelerator' not in nodeselectors:
+            nodeselectors['accelerator'] = 'nvidia'
+        if not needs_cuda and self.high_mem_pod:
+            nodeselectors['nodegroup'] = 'high-mem'
 
         # Base pod spec
         spec = {
@@ -397,7 +425,7 @@ class KubernetesPodBuilder(object):
                         'command': self.container_command(),
                         'args': self.container_args(),
                         'env': self.container_environment(),
-                        'resources': self.container_resources(),
+                        'resources': resources,
                         'volumeMounts': self.volume_mounts,
                         'workingDir': self.container_workingdir(),
                         }
@@ -426,6 +454,21 @@ class KubernetesPodBuilder(object):
                     "operator": "Exists",
                     "effect": "NoSchedule"
                 })
+            spec['spec']['tolerations'] = tolerations
+
+        if not needs_cuda and self.high_mem_pod:
+            tolerations = spec['spec'].get('tolerations', [])
+            has_hm_tol = any(
+                t.get('key') == 'nodegroup' and t.get('value') == 'high-mem' and t.get('effect') == 'NoSchedule'
+                for t in tolerations
+            )
+            if not has_hm_tol:
+                tolerations.append({
+                "key": "nodegroup",
+                "operator": "Equal",
+                "value": "high-mem",
+                "effect": "NoSchedule"
+            })
             spec['spec']['tolerations'] = tolerations
 
         return spec

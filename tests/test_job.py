@@ -428,7 +428,8 @@ class KubernetesPodBuilderTestCase(TestCase):
                 'labels': {
                     'key1': 'val1',
                     'key2': '123',
-                }
+                },
+                'annotations': {}
             },
             'apiVersion': 'v1',
             'kind':'Pod',

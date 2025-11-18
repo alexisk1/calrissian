@@ -26,9 +26,9 @@ POD_NAME_ENV_VARIABLE = 'CALRISSIAN_POD_NAME'
 K8S_FALLBACK_NAMESPACE = 'default'
 
 # Default max number of none status states for pod to start initiliaze
-MAX_STATUS_NONE_COUNTS = 5
+MAX_STATUS_NONE_COUNTS = 6
 
-WATCH_TIMEOUT_S = 5  # short, bounded HTTP watch
+WATCH_TIMEOUT_S = 30  # short, bounded HTTP watch
 
 def read_file(path):
     with open(path) as f:
@@ -55,13 +55,14 @@ class CompletionResult(object):
     The CPU and memory values should be in kubernetes units (strings).
     """
 
-    def __init__(self, exit_code, cpus, memory, start_time, finish_time, tool_log):
+    def __init__(self, exit_code, cpus, memory, start_time, finish_time, tool_log, error_msg=None):
         self.exit_code = exit_code
         self.cpus = cpus
         self.memory = memory
         self.start_time = start_time
         self.finish_time = finish_time
         self.tool_log = tool_log
+        self.error_msg = error_msg
 
 SIDECAR_PREFIXES = ('vault-agent',)
 
@@ -205,7 +206,28 @@ class KubernetesClient(object):
                 return f"init container '{s.name}' terminated: {st.terminated.reason or st.terminated.exit_code}"
         return None
 
-    @retry_exponential_if_exception_type((ApiException, HTTPError, IncompleteStatusException), log)
+
+    def _make_failure_result(self, pod_name: str, reason: str) -> CompletionResult:
+        """
+        Build a CompletionResult that the reporter can always parse.
+        - exit_code: -1 (our convention for infra/pod-level failure)
+        - cpus/memory: valid k8s strings so TimedResourceReport won't explode
+        """
+        now = datetime.now(timezone.utc)
+        zoo_message = {"exit_code": -1, "step": pod_name, "error_msg": reason}
+        return CompletionResult(
+            exit_code=-1,
+            cpus="0m",               # must be a string, not int
+            memory="0Mi",            # must be a string, not int
+            start_time=now,
+            finish_time=now,
+            tool_log=self.tool_log,
+            error_msg=zoo_message if pod_name else reason,
+        )
+
+
+
+    @retry_exponential_if_exception_type((ApiException, HTTPError, CalrissianJobException, IncompleteStatusException), log)
     def wait_for_completion(self) -> CompletionResult:
         w = watch.Watch()
 
@@ -215,69 +237,214 @@ class KubernetesClient(object):
             field_selector=self._get_pod_field_selector(),
             timeout_seconds=WATCH_TIMEOUT_S,
         ):
-            pod = event['object']
+            pod = event["object"]
+            pod_name = pod.metadata.name
             ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            log.info("%s wait_for_completion pods object %s", ts, pod.metadata.name)
+            log.info("%s wait_for_completion pods object %s", ts, pod_name)
+            log.info("Pod status object %s", str(pod.status))
 
-            # detect init container failures early
-            init_reason = self._any_init_container_failing(pod)
-            if init_reason:
-                log.error(f"wait_for_completion init_reason error {pod.metadata.name}: {init_reason}")
-                # try to dump last init logs for context
-                try:
-                    init_names = [s.name for s in (pod.status.init_container_statuses or [])]
-                    for iname in init_names:
-                        try:
-                            ilog = self.core_api_instance.read_namespaced_pod_log(
-                                pod.metadata.name, self.namespace, container=iname, previous=True, tail_lines=200
-                            )
-                            for ln in ilog.splitlines():
-                                self.tool_log.append(self.format_log_entry(pod.metadata.name, f"[init:{iname}] {ln}"))
-                        except Exception:
-                            pass
-                finally:
-                    raise CalrissianJobException(init_reason)
+            # -----------------------------------------------------------
+            # 1) Detect pod scheduling / pending issues early
+            # -----------------------------------------------------------
+            if pod.status and pod.status.phase == "Pending":
+                # see if it's explicitly unschedulable
+                unschedulable_reason = None
+                for cond in pod.status.conditions or []:
+                    if cond.type == "PodScheduled" and cond.status == "False":
+                        unschedulable_reason = f"{cond.reason}: {cond.message}"
 
-            main_name = self._pick_main_container_name(pod)
-            status = self._get_container_status_by_name(pod, main_name)
-            log.info('wait_for_completion pod name {} with container name {} with id {} has status {}'.format(pod.metadata.name, main_name, pod.metadata.uid, status))
+                # generic pending → try a few times
+                log.info(
+                    "wait_for_completion pod %s is Pending counts: %s max: %s reason: %s",
+                    pod_name,
+                    str(self.status_none_count),
+                    str(MAX_STATUS_NONE_COUNTS),
+                    str(unschedulable_reason),
+                )
 
-            if status is None:
-                log.info('wait_for_completion pod status_is_none {} container {}'.format(pod.metadata.name, main_name,  self.status_none_count))
-                if self.status_none_count < MAX_STATUS_NONE_COUNTS:
+                if unschedulable_reason:
+                    log.info("%s wait_for_completion pod %s cannot be scheduled reason %s: ", ts, pod_name, unschedulable_reason)
+
+                    self.completion_result = self._make_failure_result(
+                        pod_name,
+                        reason=f"Pod unschedulable: {unschedulable_reason}",
+                    )
+                    w.stop()
+                    break
+                elif self.status_none_count < MAX_STATUS_NONE_COUNTS:
                     self.status_none_count += 1
+                    continue
                 else:
-                    raise CalrissianJobException('Unexpected pod container status_is_none max limit ', status)
-                continue
-            elif self.state_is_waiting(status.state):
-                log.info('wait_for_completion state_is_waiting pod name {} with container name {} with id {} has status {} '.format(pod.metadata.name, main_name, pod.metadata.uid, status))
-                continue
-            elif self.state_is_running(status.state):
-                # Can only get logs once container is running
-                # follow logs for the workload container only
-                log.info('wait_for_completion state_is_running pod name {} with container name {} with id {} has status {} '.format(pod.metadata.name, main_name, pod.metadata.uid, status))
-                self.follow_logs(container_name=main_name) # This will not return until pod completes
-                log.info('wait_for_completion pod {} follow_logs container {} '.format(pod.metadata.name, main_name))
+                    raise CalrissianJobException('Unexpected pod state for too long.', unschedulable_reason)
 
-            elif self.state_is_terminated(status.state):
-                log.info('wait_for_completion Handling terminated pod name {} with id {}'.format(pod.metadata.name, pod.metadata.uid))
+
+
+
+            # -----------------------------------------------------------
+            # 2) From here on we expect to deal with the main container
+            # -----------------------------------------------------------
+            main_name = self._pick_main_container_name(pod)
+            container_status = self._get_container_status_by_name(pod, main_name)
+            log.info(
+                "wait_for_completion pod name %s with container name %s with id %s has status %s",
+                pod_name,
+                main_name,
+                pod.metadata.uid,
+                container_status,
+            )
+
+            # container status can still be None here (pod in transition)
+            if container_status is None:
+                log.info(
+                    "wait_for_completion container_status is None for pod %s – counts: %s max: %s",
+                    pod_name,
+                    str(self.status_none_count),
+                    str(MAX_STATUS_NONE_COUNTS),
+                )
+                init_reason = self._any_init_container_failing(pod)
+
+                if init_reason:
+                    log.error("wait_for_completion init_reason error %s: %s", pod_name, init_reason)
+                    # best-effort to fetch init logs
+                    try:
+                        init_names = [s.name for s in (pod.status.init_container_statuses or [])]
+                        for iname in init_names:
+                            try:
+                                ilog = self.core_api_instance.read_namespaced_pod_log(
+                                    pod_name,
+                                    self.namespace,
+                                    container=iname,
+                                    previous=True,
+                                    tail_lines=200,
+                                )
+                                for ln in ilog.splitlines():
+                                    self.tool_log.append(self.format_log_entry(pod_name, f"[init:{iname}] {ln}"))
+                            except Exception:
+                                pass
+                    finally:
+                        self.completion_result = self._make_failure_result(
+                            pod_name,
+                            reason=f"Init container failed: {init_reason}",
+                        )
+                        w.stop()
+                    break
+                elif self.status_none_count < MAX_STATUS_NONE_COUNTS:
+                    self.status_none_count += 1
+                    continue
+                else:
+                    self.completion_result = self._make_failure_result(
+                        pod_name,
+                        reason="Pod container status stayed None for too long",
+                    )
+                    w.stop()
+                    break
+
+            state = container_status.state
+
+
+            # -----------------------------------------------------------
+            # 3) Detect init container failures early
+            # -----------------------------------------------------------
+            if state == None:
+                log.error("wait_for_completion waiting for container", main_name)
+            # -----------------------------------------------------------
+            # 4) Waiting state – ALSO detect image pull issues here
+            # -----------------------------------------------------------
+            elif self.state_is_waiting(state):
+                log.info(
+                    "wait_for_completion state_is_waiting pod name %s with container name %s with id %s has status %s",
+                    pod_name,
+                    main_name,
+                    pod.metadata.uid,
+                    container_status,
+                )
+
+                waiting = state.waiting
+                reason = waiting.reason if waiting else None
+                message = waiting.message if waiting else None
+
+                image_pull_reasons = {"ErrImagePull", "ImagePullBackOff", "RegistryUnavailable"}
+                is_image_pull_issue = False
+                if reason in image_pull_reasons:
+                    is_image_pull_issue = True
+                elif message and "pull" in message.lower() and "image" in message.lower():
+                    is_image_pull_issue = True
+
+                if is_image_pull_issue:
+                    image_name = None
+                    try:
+                        spec = self._get_container_spec_by_name(pod, main_name)
+                        if spec:
+                            image_name = spec.image
+                    except Exception:
+                        pass
+
+                    self.completion_result = self._make_failure_result(
+                        pod_name,
+                        reason=(
+                            f"Image pull failed: {reason or 'unknown'}; "
+                            f"{message or ''}; image={image_name or 'unknown'}"
+                        ),
+                    )
+                    w.stop()
+                    raise CalrissianJobException(f'Docker image pull issue for container {main_name} pod {pod_name} reason {reason} message {message}.')
+
+
+                # plain waiting – keep watching
+                continue
+
+
+            # -----------------------------------------------------------
+            # 5) Running – follow logs, then we expect a terminated event
+            # -----------------------------------------------------------
+            elif self.state_is_running(state):
+                log.info(
+                    "wait_for_completion state_is_running pod name %s with container name %s with id %s has status %s",
+                    pod_name,
+                    main_name,
+                    pod.metadata.uid,
+                    container_status,
+                )
+                self.follow_logs(container_name=main_name)
+                log.info("wait_for_completion pod %s follow_logs container %s", pod_name, main_name)
+                # after logs return, we loop again to see the terminated state
+                continue
+
+            # -----------------------------------------------------------
+            # 6) Terminated – normal success/failure from container
+            # -----------------------------------------------------------
+            elif self.state_is_terminated(state):
+                log.info(
+                    "wait_for_completion Handling terminated pod name %s with id %s",
+                    pod_name,
+                    pod.metadata.uid,
+                )
                 container = self._get_container_spec_by_name(pod, main_name)
-                self._handle_completion(status.state, container)
+                self._handle_completion(state, container)
                 if self.should_delete_pod():
                     with PodMonitor() as monitor:
-                        self.delete_pod_name(pod.metadata.name)
+                        self.delete_pod_name(pod_name)
                         monitor.remove(pod)
                 self._clear_pod()
-                # stop watching for events, our pod is done. Causes wait loop to exit
                 w.stop()
-            else:
-                raise CalrissianJobException('Unexpected pod container status', status)
-        
-        # When the pod is done we should have a completion result
-        # Otherwise it will lead to further exceptions
+                break
+
+            # -----------------------------------------------------------
+            # 7) Anything else – make it a failure result, not an exception
+            # -----------------------------------------------------------
+            log.error("wait_for_completion Unexpected pod container status for %s: %s", pod_name, container_status)
+            continue
+            
+
+        # -----------------------------------------------------------
+        # 8) Final safeguard
+        # -----------------------------------------------------------
         if self.completion_result is None:
+            log.error("wait_for_completion Finished with no completion result.")
             raise IncompleteStatusException
+
         return self.completion_result
+
 
     def _set_pod(self, pod):
         log.info('k8s pod \'{}\' started'.format(pod.metadata.name))

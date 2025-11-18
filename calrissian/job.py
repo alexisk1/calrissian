@@ -314,9 +314,9 @@ class KubernetesPodBuilder(object):
         log.debug(f'Building resources spec from {self.resources}')
         container_resources = {}
 
-        # To evaluate high_mem_node compute container_resources before
+        # Preselect high mem node as default
         # node selection
-        self.high_mem_pod = False
+        self.high_mem_pod = True
         for cwl_field, cwl_value in self.resources.items():
             resource_bound = 'requests'
             resource_type = self.resource_type(cwl_field)
@@ -325,18 +325,6 @@ class KubernetesPodBuilder(object):
                 if not container_resources.get(resource_bound):
                     container_resources[resource_bound] = {}
                 container_resources[resource_bound][resource_type] = resource_value
-                # cwl_value is the RAM amount in MiB (numeric); resource_value is a string like "4096Mi"
-                if resource_type == 'memory':
-                    try:
-                        mem_mib = int(cwl_value)
-                    except (TypeError, ValueError):
-                        # Fallback in case a string sneaks in
-                        mem_mib = int(str(cwl_value).rstrip("Mi"))
-                        log.debug(f'high_mem_pod   mem_mib {mem_mib}')
-
-                    if mem_mib >= HIGH_MEM_POD_THRESHOLD:
-                        self.high_mem_pod = True
-                        log.debug(f'high_mem_pod  {self.high_mem_pod }')
 
 
         all_requirements = self.requirements + self.hints

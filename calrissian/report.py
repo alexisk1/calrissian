@@ -7,7 +7,7 @@ import threading
 log = logging.getLogger("calrissian.report")
 
 SECONDS_PER_HOUR = 60.0 * 60.0
-
+SECONDS_PER_MINUTE= 60.0
 
 class TimedReport(object):
     """
@@ -43,10 +43,18 @@ class TimedReport(object):
         else:
             return None
 
+    def elapsed_minutes(self):
+        elapsed_seconds = self.elapsed_seconds()
+        if elapsed_seconds:
+            return elapsed_seconds / SECONDS_PER_MINUTE
+        else:
+            return None
+
     def to_dict(self):
         # Create a dict of our variables, filtering out None
         result = dict((k,v) for k,v in vars(self).items() if v is not None)
         result['elapsed_hours'] = self.elapsed_hours()
+        result['elapsed_minutes'] = self.elapsed_minutes()
         result['elapsed_seconds'] = self.elapsed_seconds()
         return result
 
@@ -115,11 +123,12 @@ class TimedResourceReport(TimedReport):
     duration of the timed report. These values, by convention, are the kubernetes **requested**
     resources (not limits or actual).
     """
-    def __init__(self, cpus=0, ram_megabytes=0, disk_megabytes=0, exit_code=0, *args, **kwargs):
+    def __init__(self, cpus=0, ram_megabytes=0, disk_megabytes=0, exit_code=0, message="", *args, **kwargs):
         self.cpus = cpus
         self.ram_megabytes = ram_megabytes
         self.disk_megabytes = disk_megabytes
         self.exit_code = exit_code
+        self.message = message
         super(TimedResourceReport, self).__init__(*args, **kwargs)
 
     def ram_megabyte_hours(self):
@@ -151,7 +160,7 @@ class TimedResourceReport(TimedReport):
 
         return cls(name=name, start_time=completion_result.start_time, finish_time=completion_result.finish_time, cpus=cpus,
                    ram_megabytes=ram_megabytes, disk_megabytes=disk_megabytes,
-                   exit_code=completion_result.exit_code)
+                   exit_code=completion_result.exit_code, message=completion_result.error_msg)
 
 
 class Event(object):

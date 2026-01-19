@@ -23,6 +23,7 @@ import string
 import shellescape
 import re
 from cwltool.utils import visit_class, ensure_writable
+from datetime import datetime, timezone
 
 log = logging.getLogger("calrissian.job")
 log_main = logging.getLogger("calrissian.main")
@@ -38,10 +39,19 @@ HIGH_MEM_POD_THRESHOLD = 7800
 class VolumeBuilderException(WorkflowException):
     pass
 
-
 class CalrissianCommandLineJobException(WorkflowException):
     pass
 
+class MaxLimitsResourcesException(WorkflowException):
+    pass
+
+
+# Hard limits per nodegroup (EXAMPLE values – adjust to your cluster)
+MAX_HIGH_MEM_CPU_REQUEST = 12        # cores
+MAX_HIGH_MEM_RAM_REQUEST_MI = 100000 # MiB
+
+MAX_CUDA_CPU_REQUEST = 64            # cores
+MAX_CUDA_RAM_REQUEST_MI = 50000     # MiB
 
 def k8s_safe_name(name):
     """
@@ -310,6 +320,42 @@ class KubernetesPodBuilder(object):
         else:
             return None
 
+    @staticmethod
+    def _parse_cpu(cpu_str):
+        try:
+            return float(str(cpu_str))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _parse_memory(mem_str):
+        s = str(mem_str)
+        try:
+            if s.endswith('Mi'):
+                return float(s[:-2])
+            if s.endswith('Gi'):
+                return float(s[:-2]) * 1024.0
+            return float(s)   # assume Mi
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _request_not_exceed_limit(cls, req, limit, kind):
+        if kind == 'cpu':
+            r = cls._parse_cpu(req)
+            l = cls._parse_cpu(limit)
+        elif kind == 'memory':
+            r = cls._parse_memory(req)
+            l = cls._parse_memory(limit)
+        else:
+            return True
+
+        if r is None or l is None:
+            return True
+
+        return r <= l
+
+
     def container_resources(self):
         log.debug(f'Building resources spec from {self.resources}')
         container_resources = {}
@@ -318,21 +364,31 @@ class KubernetesPodBuilder(object):
         # node selection
         self.high_mem_pod = True
         for cwl_field, cwl_value in self.resources.items():
-            resource_bound = 'requests'
-            resource_type = self.resource_type(cwl_field)
-            resource_value = self.resource_value(resource_type, cwl_value)
-            if resource_type and resource_value:
-                if not container_resources.get(resource_bound):
-                    container_resources[resource_bound] = {}
-                container_resources[resource_bound][resource_type] = resource_value
+            if cwl_field in ['cores', 'ram']:
+                resource_bound = 'requests'
+                resource_type = self.resource_type(cwl_field)
+                resource_value = self.resource_value(resource_type, cwl_value)
+                if resource_type and resource_value:
+                    if not container_resources.get(resource_bound):
+                        container_resources[resource_bound] = {}
+                    container_resources[resource_bound][resource_type] = resource_value
 
+            elif cwl_field in ['coresMax', 'ramMax']:
+                resource_bound = 'limits'
+                resource_type = self.resource_type(cwl_field)
+                resource_value = self.resource_value(resource_type, cwl_value)
+                if resource_type and resource_value:
+                    if not container_resources.get(resource_bound):
+                        container_resources[resource_bound] = {}
+                    container_resources[resource_bound][resource_type] = resource_value
 
         all_requirements = self.requirements + self.hints
+        needs_cuda = False
         # Add CUDA requirements from CWL
         for requirement in all_requirements:
             if requirement["class"] in ['cwltool:CUDARequirement', 'http://commonwl.org/cwltool#CUDARequirement']:
                 log.debug('Adding CUDARequirement resources spec')
-
+                needs_cuda = True
                 resource_bound = 'requests'
                 container_resources[resource_bound]['nvidia.com/gpu'] = str(requirement["cudaDeviceCountMin"])
                 if "limits" in container_resources:
@@ -341,6 +397,49 @@ class KubernetesPodBuilder(object):
                 else:
                     container_resources['limits'] = {'nvidia.com/gpu': str(requirement["cudaDeviceCountMax"])}
 
+        requests = container_resources.get('requests', {})
+        limits = container_resources.get('limits', {})
+
+        if 'limits' not in container_resources:
+            container_resources['limits'] = limits
+        for kind in ('cpu', 'memory'):
+                if kind in requests and kind not in limits:
+                    limits[kind] = requests[kind]
+
+        if needs_cuda:
+            max_cpu = MAX_CUDA_CPU_REQUEST
+            max_ram_mi = MAX_CUDA_RAM_REQUEST_MI
+        else:
+            max_cpu = MAX_HIGH_MEM_CPU_REQUEST
+            max_ram_mi = MAX_HIGH_MEM_RAM_REQUEST_MI
+
+        violations = []
+    
+        # Check requests
+        req_cpu = self._parse_cpu(requests.get('cpu'))
+        req_ram = self._parse_memory(requests.get('memory'))
+        
+        if req_cpu is not None and req_cpu > max_cpu:
+            violations.append('cpu request')
+        if req_ram is not None and req_ram > max_ram_mi:
+            violations.append('memory request')
+
+        # Check limits
+        lim_cpu = self._parse_cpu(limits.get('cpu'))
+        lim_ram = self._parse_memory(limits.get('memory'))
+        if lim_cpu is not None and lim_cpu > max_cpu:
+            violations.append('cpu limit')
+        if lim_ram is not None and lim_ram > max_ram_mi:
+            violations.append('memory limit')
+        heap_gb = int(lim_ram * 0.85 / 1024)   # e.g. 85%
+        self.environment["JAVA_TOOL_OPTIONS"] = f"-Xms4g -Xmx{heap_gb}g"
+        self.environment["JAVA_OPTS"] = f"-Xms4g -Xmx{heap_gb}g -XX:+UseG1GC -XX:MaxGCPauseMillis=200"
+        self.environment["_JAVA_OPTIONS"] = f"-Xms4g -Xmx{heap_gb}g"
+
+        if violations:
+            raise MaxLimitsResourcesException(
+                f"The maximum limits of CPU requests are {max_cpu} and for RAM {max_ram_mi}"
+            )
         return container_resources
 
     def pod_labels(self):
@@ -801,13 +900,28 @@ class CalrissianCommandLineJob(ContainerCommandLineJob):
         self.setup_kubernetes(runtimeContext)
 
         self._setup(runtimeContext)
-        
-        pod = self.create_kubernetes_runtime(runtimeContext) # analogous to create_runtime()
-        self.execute_kubernetes_pod(pod) # analogous to _execute()
-        completion_result = self.wait_for_kubernetes_pod()
-        if completion_result.exit_code != 0:
+        pod = None
+        try:
+            now = datetime.now(timezone.utc)
+            pod = self.create_kubernetes_runtime(runtimeContext) # analogous to create_runtime()
+            self.execute_kubernetes_pod(pod) # analogous to _execute()
+            completion_result = self.wait_for_kubernetes_pod()
+        except (MaxLimitsResourcesException, CalrissianCommandLineJobException, VolumeBuilderException) as e:
+            completion_result = CompletionResult(
+                exit_code=-1,
+                cpus="0m",
+                memory="0Mi",
+                start_time=now,
+                finish_time=now,
+                tool_log="",
+                error_msg=str(e),
+            )
+
+        if pod and completion_result.exit_code != 0:
             log_main.error(f"ERROR the command below failed in pod {get_pod_name(pod)}:")
             log_main.error("\t" + " ".join(get_pod_command(pod)))
+        elif completion_result.exit_code != 0:
+            log_main.error("ERROR the pod could not be created")
         self.finish(completion_result, runtimeContext)
     
     def setup_kubernetes(self, runtime_context):

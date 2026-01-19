@@ -83,7 +83,9 @@ class KubernetesClient(object):
         self.namespace = load_config_get_namespace()
         self.core_api_instance = client.CoreV1Api()
         self.tool_log = []
-        self.status_none_count = 0
+        self.counters = {"Pending": 0,
+                         "InitContainer": 0,
+                         "DockerImageError": 0}
 
     @retry_exponential_if_exception_type((ApiException, HTTPError,), log)
     def submit_pod(self, pod_body):
@@ -241,7 +243,9 @@ class KubernetesClient(object):
             pod_name = pod.metadata.name
             ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             log.info("%s wait_for_completion pods object %s", ts, pod_name)
-            log.info("Pod status object %s", str(pod.status))
+            log.info("------------------------------------------------------------------------------------------------")
+            log.info("Pod status object is= %s", str(pod.status))
+            log.info("------------------------------------------------------------------------------------------------")
 
             # -----------------------------------------------------------
             # 1) Detect pod scheduling / pending issues early
@@ -257,27 +261,22 @@ class KubernetesClient(object):
                 log.info(
                     "wait_for_completion pod %s is Pending counts: %s max: %s reason: %s",
                     pod_name,
-                    str(self.status_none_count),
+                    str(self.counters["Pending"]),
                     str(MAX_STATUS_NONE_COUNTS),
                     str(unschedulable_reason),
                 )
 
-                if unschedulable_reason:
+                if unschedulable_reason and  self.counters["Pending"] < MAX_STATUS_NONE_COUNTS:
+                    self.counters["Pending"] += 1
+                    continue
+                elif unschedulable_reason:
                     log.info("%s wait_for_completion pod %s cannot be scheduled reason %s: ", ts, pod_name, unschedulable_reason)
-
                     self.completion_result = self._make_failure_result(
                         pod_name,
                         reason=f"Pod unschedulable: {unschedulable_reason}",
                     )
                     w.stop()
                     break
-                elif self.status_none_count < MAX_STATUS_NONE_COUNTS:
-                    self.status_none_count += 1
-                    continue
-                else:
-                    raise CalrissianJobException('Unexpected pod state for too long.', unschedulable_reason)
-
-
 
 
             # -----------------------------------------------------------
@@ -298,7 +297,7 @@ class KubernetesClient(object):
                 log.info(
                     "wait_for_completion container_status is None for pod %s – counts: %s max: %s",
                     pod_name,
-                    str(self.status_none_count),
+                    str(self.counters["InitContainer"]),
                     str(MAX_STATUS_NONE_COUNTS),
                 )
                 init_reason = self._any_init_container_failing(pod)
@@ -328,8 +327,8 @@ class KubernetesClient(object):
                         )
                         w.stop()
                     break
-                elif self.status_none_count < MAX_STATUS_NONE_COUNTS:
-                    self.status_none_count += 1
+                elif self.counters["InitContainer"]< MAX_STATUS_NONE_COUNTS:
+                    self.counters["InitContainer"] += 1
                     continue
                 else:
                     self.completion_result = self._make_failure_result(
@@ -339,13 +338,13 @@ class KubernetesClient(object):
                     w.stop()
                     break
 
-            state = container_status.state
 
+            state = container_status.state
 
             # -----------------------------------------------------------
             # 3) Detect init container failures early
             # -----------------------------------------------------------
-            if state == None:
+            if state is None:
                 log.error("wait_for_completion waiting for container", main_name)
             # -----------------------------------------------------------
             # 4) Waiting state – ALSO detect image pull issues here
@@ -378,18 +377,18 @@ class KubernetesClient(object):
                             image_name = spec.image
                     except Exception:
                         pass
+                    result_reason = f"Image pull failed={image_name or 'unknown'}; {reason or 'unknown'}; {message}"
+                    log.info(
+                        f"wait_for_completion Image pull issue pod name:{str(pod_name)}  container name: {main_name} reason: {message}" ,
+                        
+                    )
 
                     self.completion_result = self._make_failure_result(
                         pod_name,
-                        reason=(
-                            f"Image pull failed: {reason or 'unknown'}; "
-                            f"{message or ''}; image={image_name or 'unknown'}"
-                        ),
+                        reason=result_reason,
                     )
                     w.stop()
-                    raise CalrissianJobException(f'Docker image pull issue for container {main_name} pod {pod_name} reason {reason} message {message}.')
-
-
+                    break
                 # plain waiting – keep watching
                 continue
 
